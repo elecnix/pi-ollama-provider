@@ -5,6 +5,12 @@
  * This avoids needing a separate config file while giving users control
  * over Ollama-specific options (temperature, num_ctx, top_p, etc.).
  *
+ * Settings schema versioning: v2 adds a "version" field for forward compat.
+ * On read, if the version is missing (v1) or incompatible, defaults are applied.
+ *
+ * Atomic writes: writeSettings uses a temp file + rename pattern to prevent
+ * corruption if pi crashes mid-write.
+ *
  * Commands:
  *   /ollama-setup   — Interactive setup wizard (local or cloud)
  *   /ollama-refresh  — Re-discover models
@@ -14,15 +20,19 @@
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, renameSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 
 const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
+const SETTINGS_VERSION = 1;
 
 // ── settings ──
 
 export interface OllamaSettings {
+  /** Schema version for forward compatibility */
+  version?: number;
   /** Default num_ctx for all models (default: model's context_length from /api/show) */
   defaultNumCtx?: number;
   /** Default keep_alive (default: "30m") */
@@ -43,14 +53,136 @@ export interface OllamaSettings {
 }
 
 const DEFAULT_SETTINGS: OllamaSettings = {
+  version: SETTINGS_VERSION,
   keepAlive: "30m",
   streamingMode: "native",
   autoPull: true,
 };
 
+// ── settings validation ──
+
+/** Validation issues found in settings. Non-fatal — logged as warnings. */
+export interface SettingsValidationIssue {
+  key: string;
+  value: unknown;
+  message: string;
+}
+
+/**
+ * Validate an OllamaSettings object, returning issues for invalid values.
+ * Invalid values are reset to defaults; issues are returned for logging.
+ */
+export function validateSettings(settings: Partial<OllamaSettings>): {
+  validated: OllamaSettings;
+  issues: SettingsValidationIssue[];
+} {
+  const issues: SettingsValidationIssue[] = [];
+  const validated = { ...DEFAULT_SETTINGS, ...settings };
+
+  // Validate streamingMode
+  if (
+    validated.streamingMode !== undefined &&
+    validated.streamingMode !== "native" &&
+    validated.streamingMode !== "openai-compat"
+  ) {
+    issues.push({
+      key: "streamingMode",
+      value: validated.streamingMode,
+      message: `Invalid streamingMode "${validated.streamingMode}", expected "native" or "openai-compat". Defaulting to "native".`,
+    });
+    validated.streamingMode = "native";
+  }
+
+  // Validate defaultNumCtx
+  if (validated.defaultNumCtx !== undefined) {
+    if (typeof validated.defaultNumCtx !== "number" || validated.defaultNumCtx <= 0 || !Number.isFinite(validated.defaultNumCtx)) {
+      issues.push({
+        key: "defaultNumCtx",
+        value: validated.defaultNumCtx,
+        message: `Invalid defaultNumCtx ${validated.defaultNumCtx}, expected positive integer. Ignoring.`,
+      });
+      delete validated.defaultNumCtx;
+    } else if (validated.defaultNumCtx > 131072) {
+      issues.push({
+        key: "defaultNumCtx",
+        value: validated.defaultNumCtx,
+        message: `defaultNumCtx ${validated.defaultNumCtx} exceeds 131072 safety cap. Capping.`,
+      });
+      validated.defaultNumCtx = Math.min(validated.defaultNumCtx, 131072);
+    }
+  }
+
+  // Validate temperature
+  if (validated.options?.temperature !== undefined) {
+    const t = validated.options.temperature;
+    if (typeof t !== "number" || t < 0 || t > 2 || !Number.isFinite(t)) {
+      issues.push({
+        key: "options.temperature",
+        value: t,
+        message: `Invalid temperature ${t}, expected number between 0 and 2. Ignoring.`,
+      });
+      delete validated.options.temperature;
+    }
+  }
+
+  // Validate top_p
+  if (validated.options?.top_p !== undefined) {
+    const p = validated.options.top_p;
+    if (typeof p !== "number" || p < 0 || p > 1 || !Number.isFinite(p)) {
+      issues.push({
+        key: "options.top_p",
+        value: p,
+        message: `Invalid top_p ${p}, expected number between 0 and 1. Ignoring.`,
+      });
+      delete validated.options.top_p;
+    }
+  }
+
+  // Validate top_k
+  if (validated.options?.top_k !== undefined) {
+    const k = validated.options.top_k;
+    if (typeof k !== "number" || k < 0 || !Number.isFinite(k) || !Number.isInteger(k)) {
+      issues.push({
+        key: "options.top_k",
+        value: k,
+        message: `Invalid top_k ${k}, expected non-negative integer. Ignoring.`,
+      });
+      delete validated.options.top_k;
+    }
+  }
+
+  // Validate keepAlive format
+  if (validated.keepAlive !== undefined) {
+    const ka = validated.keepAlive;
+    if (typeof ka !== "string" || !/^(\d+[smh]?$|^\d+:\d+$)/.test(ka)) {
+      issues.push({
+        key: "keepAlive",
+        value: ka,
+        message: `Invalid keepAlive "${ka}", expected duration like "30m", "1h", or "3600s". Defaulting to "30m".`,
+      });
+      validated.keepAlive = "30m";
+    }
+  }
+
+  // Validate autoPull
+  if (validated.autoPull !== undefined && typeof validated.autoPull !== "boolean") {
+    issues.push({
+      key: "autoPull",
+      value: validated.autoPull,
+      message: `Invalid autoPull ${String(validated.autoPull)}, expected boolean. Defaulting to true.`,
+    });
+    validated.autoPull = true;
+  }
+
+  // Ensure version is set
+  validated.version = SETTINGS_VERSION;
+
+  return { validated, issues };
+}
+
 /**
  * Read ollama settings from ~/.pi/agent/settings.json.
- * Merges with defaults for any missing keys.
+ * Merges with defaults for any missing keys and validates values.
  */
 export function readSettings(): OllamaSettings {
   try {
@@ -58,7 +190,21 @@ export function readSettings(): OllamaSettings {
     const data = readFileSync(SETTINGS_PATH, "utf-8");
     const parsed = JSON.parse(data);
     const ollamaSection = parsed?.ollama ?? {};
-    return { ...DEFAULT_SETTINGS, ...ollamaSection };
+
+    // Check version — if missing or incompatible, use defaults
+    if (ollamaSection.version !== undefined && ollamaSection.version > SETTINGS_VERSION) {
+      console.log(
+        `[ollama] settings version ${ollamaSection.version} is newer than supported (${SETTINGS_VERSION}), using defaults for unknown keys`,
+      );
+    }
+
+    const { validated, issues } = validateSettings(ollamaSection);
+
+    for (const issue of issues) {
+      console.log(`[ollama] Settings warning: ${issue.message}`);
+    }
+
+    return validated;
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -66,9 +212,16 @@ export function readSettings(): OllamaSettings {
 
 /**
  * Write ollama settings, preserving other settings in the file.
+ * Uses atomic write (temp file + rename) to prevent corruption on crash.
  */
 export function writeSettings(settings: OllamaSettings): void {
   try {
+    // Validate before writing
+    const { validated, issues } = validateSettings(settings);
+    for (const issue of issues) {
+      console.log(`[ollama] Settings warning: ${issue.message}`);
+    }
+
     let existing: Record<string, unknown> = {};
     try {
       if (existsSync(SETTINGS_PATH)) {
@@ -77,8 +230,20 @@ export function writeSettings(settings: OllamaSettings): void {
       }
     } catch {}
 
-    existing.ollama = settings;
-    writeFileSync(SETTINGS_PATH, JSON.stringify(existing, null, 2), "utf-8");
+    existing.ollama = validated;
+
+    // Atomic write: temp file + rename
+    const tmpDir = mkdtempSync(join(tmpdir(), "pi-ollama-settings-"));
+    const tmpPath = join(tmpDir, "settings.json");
+    try {
+      writeFileSync(tmpPath, JSON.stringify(existing, null, 2), "utf-8");
+      renameSync(tmpPath, SETTINGS_PATH);
+    } finally {
+      // Clean up temp dir if rename failed
+      try {
+        if (existsSync(tmpDir)) rmSync(tmpDir, { recursive: true, force: true });
+      } catch {}
+    }
   } catch (err) {
     console.log(
       `[ollama] settings write failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -95,6 +260,7 @@ export async function handleStatusCommand(
   apiKey: string,
   localModelNames: Set<string>,
   loadedModels: string[],
+  authSource?: string,
 ): Promise<void> {
   ctx.ui.setStatus("ollama-status", "Checking Ollama status...");
 
@@ -147,6 +313,11 @@ export async function handleStatusCommand(
     }
   } else {
     lines.push(`⚪ Cloud: not configured (run /ollama-setup)`);
+  }
+
+  // Auth source display
+  if (authSource) {
+    lines.push(`\n🔑 **Auth**: ${authSource}`);
   }
 
   // Settings summary
@@ -416,6 +587,9 @@ export async function runSetupWizard(
     if (authStorage.has("ollama")) {
       authStorage.remove("ollama");
     }
+    if (authStorage.has("ollama-cloud")) {
+      authStorage.remove("ollama-cloud");
+    }
 
     await onConfigChange("local", localBaseUrl, "ollama");
     ctx.ui.notify(
@@ -470,7 +644,8 @@ export async function runSetupWizard(
       const data = await res.json();
       const modelCount = (data.models || []).length;
 
-      authStorage.set("ollama", { type: "api_key", key: apiKey });
+      // Store under "ollama-cloud" key (canonical key per AuthStorage convention)
+      authStorage.set("ollama-cloud", { type: "api_key", key: apiKey });
 
       await onConfigChange("cloud", cloudBaseUrl, apiKey);
       ctx.ui.notify(

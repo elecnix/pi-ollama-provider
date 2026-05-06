@@ -5,6 +5,15 @@
  *   1. Cache-first — read from ~/.pi/agent/ollama-models-cache.json (instant, no network)
  *   2. Fresh API — GET /api/tags + POST /api/show per model (background refresh)
  *
+ * Cold-start fallback:
+ *   If no cache exists and Ollama is unreachable, FALLBACK_MODELS are registered
+ *   so the user always has at least some models to select.
+ *
+ * Cache format:
+ *   v1 (legacy): plain array of OllamaModelConfig[] — discarded gracefully
+ *   v2: { version: 2, timestamp, tagsModels, showResponses, mode }
+ *   v2 stores raw API responses so cache can be re-processed without re-fetching.
+ *
  * Capability inference:
  *   - Tool support: capabilities.includes("tools") or known tool-capable families
  *   - Vision: capabilities.includes("vision"), CLIP flag, or known vision architectures
@@ -81,6 +90,31 @@ export interface OllamaShowResponse {
   capabilities?: string[];
 }
 
+// ── cache format ──
+
+/** Cache format version — bump when schema changes to invalidate old caches. */
+const CACHE_VERSION = 2;
+
+/**
+ * On-disk cache format v2: raw /api/tags and /api/show responses.
+ *
+ * Storing raw API data (instead of processed configs) means:
+ * - Cache can be re-processed without re-fetching (e.g., if capability inference changes)
+ * - Raw data is better for debugging — inspect actual API responses
+ * - Forward compatible — new fields from newer Ollama versions are preserved
+ * - Backward compatible — v1 (flat array) caches are detected and gracefully discarded
+ */
+export interface OllamaModelCache {
+  version: number;
+  timestamp: number;
+  /** Raw /api/tags response models */
+  tagsModels: OllamaTagsModel[];
+  /** Raw /api/show responses keyed by model name */
+  showResponses: Record<string, OllamaShowResponse | null>;
+  /** Config mode at time of caching ("local" or "cloud") */
+  mode: "local" | "cloud";
+}
+
 // ── constants ──
 
 const DEFAULT_CONTEXT_WINDOW = 32768;
@@ -134,6 +168,100 @@ const REASONING_PATTERNS = [
   /\bdeepseek-r1\b/i,
   /\bgemma4\b/i, // gemma4 has thinking mode
   /\bqwen3(\.\d+)?\b/i, // qwen3+ has thinking
+];
+
+// ── fallback models ──
+
+/**
+ * Fallback models for local Ollama when no cache exists and server is unreachable.
+ * These are popular models that most users will have pulled.
+ * Registered at startup to provide immediate model selection even with no network.
+ */
+export const FALLBACK_LOCAL_MODELS: OllamaModelConfig[] = [
+  {
+    id: "llama3.1:8b",
+    name: "llama3.1:8b",
+    reasoning: false,
+    input: ["text"],
+    contextWindow: 131072,
+    maxTokens: 32768,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    toolSupport: true,
+    isCloud: false,
+    ollamaName: "llama3.1:8b",
+    rawDetails: { family: "llama3.1", capabilities: ["tools"] },
+  },
+  {
+    id: "qwen2.5-coder:7b",
+    name: "qwen2.5-coder:7b",
+    reasoning: false,
+    input: ["text"],
+    contextWindow: 131072,
+    maxTokens: 32768,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    toolSupport: true,
+    isCloud: false,
+    ollamaName: "qwen2.5-coder:7b",
+    rawDetails: { family: "qwen2.5", capabilities: ["tools"] },
+  },
+  {
+    id: "gemma3:12b",
+    name: "gemma3:12b",
+    reasoning: false,
+    input: ["text", "image"],
+    contextWindow: 131072,
+    maxTokens: 8192,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    toolSupport: false,
+    isCloud: false,
+    ollamaName: "gemma3:12b",
+    rawDetails: { family: "gemma3", capabilities: ["vision"] },
+  },
+];
+
+/**
+ * Fallback models for Ollama Cloud when no cache exists and cloud is unreachable.
+ */
+export const FALLBACK_CLOUD_MODELS: OllamaModelConfig[] = [
+  {
+    id: "qwen3:32b:cloud",
+    name: "qwen3:32b (cloud)",
+    reasoning: true,
+    input: ["text"],
+    contextWindow: 131072,
+    maxTokens: 32768,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    toolSupport: true,
+    isCloud: true,
+    ollamaName: "qwen3:32b",
+    rawDetails: { family: "qwen3", capabilities: ["tools", "thinking"] },
+  },
+  {
+    id: "gemini-3-flash-preview:cloud",
+    name: "gemini-3-flash-preview (cloud)",
+    reasoning: false,
+    input: ["text", "image"],
+    contextWindow: 1048576,
+    maxTokens: 65536,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    toolSupport: true,
+    isCloud: true,
+    ollamaName: "gemini-3-flash-preview",
+    rawDetails: { family: "gemini", capabilities: ["tools", "vision"] },
+  },
+  {
+    id: "deepseek-r1:671b:cloud",
+    name: "deepseek-r1:671b (cloud)",
+    reasoning: true,
+    input: ["text"],
+    contextWindow: 131072,
+    maxTokens: 32768,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    toolSupport: true,
+    isCloud: true,
+    ollamaName: "deepseek-r1:671b",
+    rawDetails: { family: "deepseek-r1", capabilities: ["tools", "thinking"] },
+  },
 ];
 
 // ── OLLAMA_HOST resolution ──
@@ -267,29 +395,6 @@ export function generateModelId(modelName: string, isCloud: boolean): string {
 }
 
 // ── cache ──
-
-/** Cache format version — bump when schema changes to invalidate old caches. */
-const CACHE_VERSION = 2;
-
-/**
- * On-disk cache format v2: raw /api/tags and /api/show responses.
- *
- * Storing raw API data (instead of processed configs) means:
- * - Cache can be re-processed without re-fetching (e.g., if capability inference changes)
- * - Raw data is better for debugging — inspect actual API responses
- * - Forward compatible — new fields from newer Ollama versions are preserved
- * - Backward compatible — v1 (flat array) caches are detected and gracefully discarded
- */
-export interface OllamaModelCache {
-  version: number;
-  timestamp: number;
-  /** Raw /api/tags response models */
-  tagsModels: OllamaTagsModel[];
-  /** Raw /api/show responses keyed by model name */
-  showResponses: Record<string, OllamaShowResponse | null>;
-  /** Config mode at time of caching ("local" or "cloud") */
-  mode: "local" | "cloud";
-}
 
 /**
  * Read the raw cache from disk.

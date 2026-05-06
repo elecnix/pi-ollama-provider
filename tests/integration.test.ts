@@ -3,13 +3,15 @@
  * Tests the export/re-export surface and wiring between modules.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 
 // Verify all public exports from index.ts
 import {
   // auth re-exports
   resolveConfig,
+  resolveConfigAsync,
   readOllamaAuthFromJson,
+  describeAuthSource,
   DEFAULT_LOCAL_URL,
   DEFAULT_CLOUD_URL,
   // discovery re-exports
@@ -20,6 +22,8 @@ import {
   generateModelId,
   extractContextLength,
   getOllamaHost,
+  FALLBACK_LOCAL_MODELS,
+  FALLBACK_CLOUD_MODELS,
   // native-stream re-exports
   parseNDJSON,
   convertMessages,
@@ -33,17 +37,20 @@ import {
   // commands re-exports
   readSettings,
   writeSettings,
+  validateSettings,
 } from "../extensions/pi-ollama-provider/index.js";
 
 describe("Extension module exports", () => {
   it("re-exports auth functions", () => {
     expect(typeof resolveConfig).toBe("function");
+    expect(typeof resolveConfigAsync).toBe("function");
     expect(typeof readOllamaAuthFromJson).toBe("function");
+    expect(typeof describeAuthSource).toBe("function");
     expect(DEFAULT_LOCAL_URL).toBe("http://localhost:11434");
     expect(DEFAULT_CLOUD_URL).toBe("https://ollama.com");
   });
 
-  it("re-exports discovery functions", () => {
+  it("re-exports discovery functions and fallbacks", () => {
     expect(typeof hasVision).toBe("function");
     expect(typeof hasToolSupport).toBe("function");
     expect(typeof hasReasoning).toBe("function");
@@ -51,6 +58,10 @@ describe("Extension module exports", () => {
     expect(typeof generateModelId).toBe("function");
     expect(typeof extractContextLength).toBe("function");
     expect(typeof getOllamaHost).toBe("function");
+    expect(Array.isArray(FALLBACK_LOCAL_MODELS)).toBe(true);
+    expect(Array.isArray(FALLBACK_CLOUD_MODELS)).toBe(true);
+    expect(FALLBACK_LOCAL_MODELS.length).toBeGreaterThanOrEqual(3);
+    expect(FALLBACK_CLOUD_MODELS.length).toBeGreaterThanOrEqual(2);
   });
 
   it("re-exports native-stream functions", () => {
@@ -67,9 +78,10 @@ describe("Extension module exports", () => {
     expect(typeof getDefaultKeepAlive).toBe("function");
   });
 
-  it("re-exports command functions", () => {
+  it("re-exports command functions including validateSettings", () => {
     expect(typeof readSettings).toBe("function");
     expect(typeof writeSettings).toBe("function");
+    expect(typeof validateSettings).toBe("function");
   });
 });
 
@@ -100,5 +112,61 @@ describe("Cross-module compatibility", () => {
     expect(calculateNumCtx(0)).toBe(32768);
     // And uses model's actual context for known models
     expect(calculateNumCtx(131072)).toBe(131072);
+  });
+});
+
+describe("Fallback models cross-module checks", () => {
+  it("all fallback local models have toolSupport flag", () => {
+    const withTools = FALLBACK_LOCAL_MODELS.filter(m => m.toolSupport);
+    expect(withTools.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("all fallback cloud models support tools (required for coding agent)", () => {
+    for (const m of FALLBACK_CLOUD_MODELS) {
+      expect(m.toolSupport).toBe(true);
+    }
+  });
+
+  it("fallback models have valid context windows", () => {
+    const all = [...FALLBACK_LOCAL_MODELS, ...FALLBACK_CLOUD_MODELS];
+    for (const m of all) {
+      expect(m.contextWindow).toBeGreaterThan(0);
+      expect(m.maxTokens).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("Auth new features integration", () => {
+  const originalApiKey = process.env.OLLAMA_API_KEY;
+
+  beforeEach(() => {
+    delete process.env.OLLAMA_API_KEY;
+  });
+
+  afterEach(() => {
+    if (originalApiKey !== undefined) {
+      process.env.OLLAMA_API_KEY = originalApiKey;
+    } else {
+      delete process.env.OLLAMA_API_KEY;
+    }
+  });
+
+  it("resolveConfigAsync returns default config for empty AuthStorage", async () => {
+    const emptyStore = { getApiKey: async () => undefined };
+    const config = await resolveConfigAsync(emptyStore);
+    expect(config.mode).toBe("local");
+    expect(config.apiKey).toBe("ollama");
+    expect(config.authSource).toBe("default");
+  });
+
+  it("describeAuthSource returns readable labels", () => {
+    expect(describeAuthSource({ mode: "local", baseUrl: DEFAULT_LOCAL_URL, apiKey: "ollama", authSource: "default" })).toBeTruthy();
+  });
+
+  it("validateSettings is callable and returns valid defaults", () => {
+    const { validated, issues } = validateSettings({});
+    expect(validated.streamingMode).toBe("native");
+    expect(validated.version).toBe(1);
+    expect(issues).toHaveLength(0);
   });
 });
