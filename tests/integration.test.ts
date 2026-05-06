@@ -3,13 +3,15 @@
  * Tests the export/re-export surface and wiring between modules.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 
 // Verify all public exports from index.ts
 import {
   // auth re-exports
   resolveConfig,
+  resolveConfigAsync,
   readOllamaAuthFromJson,
+  describeAuthSource,
   DEFAULT_LOCAL_URL,
   DEFAULT_CLOUD_URL,
   // discovery re-exports
@@ -20,6 +22,7 @@ import {
   generateModelId,
   extractContextLength,
   getOllamaHost,
+  assembleModelsFromCache,
   // native-stream re-exports
   parseNDJSON,
   convertMessages,
@@ -33,12 +36,15 @@ import {
   // commands re-exports
   readSettings,
   writeSettings,
+  validateSettings,
 } from "../extensions/pi-ollama-provider/index.js";
 
 describe("Extension module exports", () => {
   it("re-exports auth functions", () => {
     expect(typeof resolveConfig).toBe("function");
+    expect(typeof resolveConfigAsync).toBe("function");
     expect(typeof readOllamaAuthFromJson).toBe("function");
+    expect(typeof describeAuthSource).toBe("function");
     expect(DEFAULT_LOCAL_URL).toBe("http://localhost:11434");
     expect(DEFAULT_CLOUD_URL).toBe("https://ollama.com");
   });
@@ -51,6 +57,7 @@ describe("Extension module exports", () => {
     expect(typeof generateModelId).toBe("function");
     expect(typeof extractContextLength).toBe("function");
     expect(typeof getOllamaHost).toBe("function");
+    expect(typeof assembleModelsFromCache).toBe("function");
   });
 
   it("re-exports native-stream functions", () => {
@@ -67,9 +74,10 @@ describe("Extension module exports", () => {
     expect(typeof getDefaultKeepAlive).toBe("function");
   });
 
-  it("re-exports command functions", () => {
+  it("re-exports command functions including validateSettings", () => {
     expect(typeof readSettings).toBe("function");
     expect(typeof writeSettings).toBe("function");
+    expect(typeof validateSettings).toBe("function");
   });
 });
 
@@ -100,5 +108,40 @@ describe("Cross-module compatibility", () => {
     expect(calculateNumCtx(0)).toBe(32768);
     // And uses model's actual context for known models
     expect(calculateNumCtx(131072)).toBe(131072);
+  });
+});
+
+describe("Auth new features integration", () => {
+  const originalApiKey = process.env.OLLAMA_API_KEY;
+
+  beforeEach(() => {
+    delete process.env.OLLAMA_API_KEY;
+  });
+
+  afterEach(() => {
+    if (originalApiKey !== undefined) {
+      process.env.OLLAMA_API_KEY = originalApiKey;
+    } else {
+      delete process.env.OLLAMA_API_KEY;
+    }
+  });
+
+  it("resolveConfigAsync returns default config for empty AuthStorage", async () => {
+    const emptyStore = { getApiKey: async () => undefined };
+    const config = await resolveConfigAsync(emptyStore);
+    expect(config.mode).toBe("local");
+    expect(config.apiKey).toBe("ollama");
+    expect(config.authSource).toBe("default");
+  });
+
+  it("describeAuthSource returns readable labels", () => {
+    expect(describeAuthSource({ mode: "local", baseUrl: DEFAULT_LOCAL_URL, apiKey: "ollama", authSource: "default" })).toBeTruthy();
+  });
+
+  it("validateSettings is callable and returns valid defaults", () => {
+    const { validated, issues } = validateSettings({});
+    expect(validated.streamingMode).toBe("native");
+    expect(validated.streamingMode).toBe("native");
+    expect(issues).toHaveLength(0);
   });
 });

@@ -1,16 +1,18 @@
 /**
- * Tests for commands.ts — settings, setup wizard flow.
+ * Tests for commands.ts — settings, settings validation, setup wizard flow.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
   readSettings,
   writeSettings,
+  validateSettings,
   type OllamaSettings,
+  type SettingsValidationIssue,
 } from "../extensions/pi-ollama-provider/commands.js";
 
 import { runSetupWizard } from "../extensions/pi-ollama-provider/commands.js";
@@ -33,19 +35,192 @@ afterEach(() => {
 });
 
 // ════════════════════════════════════════════════════════════════
-// readSettings / writeSettings (unit tests that don't touch real FS)
+// validateSettings
+// ════════════════════════════════════════════════════════════════
+
+describe("validateSettings", () => {
+  it("validates valid settings with no issues", () => {
+    const { validated, issues } = validateSettings({
+      streamingMode: "native",
+      keepAlive: "30m",
+      autoPull: true,
+    });
+    expect(issues).toHaveLength(0);
+    expect(validated.streamingMode).toBe("native");
+    expect(validated.keepAlive).toBe("30m");
+    expect(validated.autoPull).toBe(true);
+  });
+
+  it("rejects invalid streamingMode", () => {
+    const { validated, issues } = validateSettings({
+      streamingMode: "fast" as any,
+    });
+    expect(issues.length).toBeGreaterThan(0);
+    expect(issues[0].key).toBe("streamingMode");
+    expect(validated.streamingMode).toBe("native"); // reset to default
+  });
+
+  it("accepts 'openai-compat' streamingMode", () => {
+    const { validated, issues } = validateSettings({
+      streamingMode: "openai-compat",
+    });
+    expect(issues).toHaveLength(0);
+    expect(validated.streamingMode).toBe("openai-compat");
+  });
+
+  it("rejects negative defaultNumCtx", () => {
+    const { validated, issues } = validateSettings({
+      defaultNumCtx: -1,
+    });
+    expect(issues.length).toBeGreaterThan(0);
+    expect(validated.defaultNumCtx).toBeUndefined();
+  });
+
+  it("rejects zero defaultNumCtx", () => {
+    const { validated, issues } = validateSettings({
+      defaultNumCtx: 0,
+    });
+    expect(issues.length).toBeGreaterThan(0);
+    expect(validated.defaultNumCtx).toBeUndefined();
+  });
+
+  it("rejects NaN defaultNumCtx", () => {
+    const { validated, issues } = validateSettings({
+      defaultNumCtx: NaN,
+    });
+    expect(issues.length).toBeGreaterThan(0);
+    expect(validated.defaultNumCtx).toBeUndefined();
+  });
+
+  it("rejects string defaultNumCtx", () => {
+    const { validated, issues } = validateSettings({
+      defaultNumCtx: "big" as any,
+    });
+    expect(issues.length).toBeGreaterThan(0);
+    expect(validated.defaultNumCtx).toBeUndefined();
+  });
+
+  it("caps defaultNumCtx at 131072", () => {
+    const { validated, issues } = validateSettings({
+      defaultNumCtx: 999999,
+    });
+    expect(issues.length).toBeGreaterThan(0);
+    expect(validated.defaultNumCtx).toBe(131072);
+  });
+
+  it("accepts valid defaultNumCtx", () => {
+    const { validated, issues } = validateSettings({
+      defaultNumCtx: 32768,
+    });
+    expect(issues).toHaveLength(0);
+    expect(validated.defaultNumCtx).toBe(32768);
+  });
+
+  it("rejects temperature > 2", () => {
+    const { validated, issues } = validateSettings({
+      options: { temperature: 5 },
+    });
+    expect(issues.length).toBeGreaterThan(0);
+    expect(validated.options!.temperature).toBeUndefined();
+  });
+
+  it("rejects negative temperature", () => {
+    const { validated, issues } = validateSettings({
+      options: { temperature: -0.5 },
+    });
+    expect(issues.length).toBeGreaterThan(0);
+    expect(validated.options!.temperature).toBeUndefined();
+  });
+
+  it("accepts valid temperature between 0 and 2", () => {
+    const { validated, issues } = validateSettings({
+      options: { temperature: 0.7 },
+    });
+    expect(issues).toHaveLength(0);
+    expect(validated.options!.temperature).toBe(0.7);
+  });
+
+  it("rejects top_p > 1", () => {
+    const { validated, issues } = validateSettings({
+      options: { top_p: 1.5 },
+    });
+    expect(issues.length).toBeGreaterThan(0);
+    expect(validated.options!.top_p).toBeUndefined();
+  });
+
+  it("rejects negative top_p", () => {
+    const { validated, issues } = validateSettings({
+      options: { top_p: -0.1 },
+    });
+    expect(issues.length).toBeGreaterThan(0);
+    expect(validated.options!.top_p).toBeUndefined();
+  });
+
+  it("rejects non-integer top_k", () => {
+    const { validated, issues } = validateSettings({
+      options: { top_k: 3.7 },
+    });
+    expect(issues.length).toBeGreaterThan(0);
+    expect(validated.options!.top_k).toBeUndefined();
+  });
+
+  it("rejects negative top_k", () => {
+    const { validated, issues } = validateSettings({
+      options: { top_k: -1 },
+    });
+    expect(issues.length).toBeGreaterThan(0);
+    expect(validated.options!.top_k).toBeUndefined();
+  });
+
+  it("rejects invalid keepAlive format", () => {
+    const { validated, issues } = validateSettings({
+      keepAlive: "invalid" as any,
+    });
+    expect(issues.length).toBeGreaterThan(0);
+    expect(validated.keepAlive).toBe("30m");
+  });
+
+  it("accepts valid keepAlive formats", () => {
+    const formats = ["30m", "1h", "3600s", "5", "1:30"];
+    for (const ka of formats) {
+      const { validated, issues } = validateSettings({ keepAlive: ka } as any);
+      expect(issues).toHaveLength(0);
+      expect(validated.keepAlive).toBe(ka);
+    }
+  });
+
+  it("rejects non-boolean autoPull", () => {
+    const { validated, issues } = validateSettings({
+      autoPull: "yes" as any,
+    });
+    expect(issues.length).toBeGreaterThan(0);
+    expect(validated.autoPull).toBe(true);
+  });
+
+  it("merges empty settings with defaults", () => {
+    const { validated } = validateSettings({});
+    expect(validated.streamingMode).toBe("native");
+  });
+
+  it("handles empty settings object", () => {
+    const { validated, issues } = validateSettings({});
+    expect(issues).toHaveLength(0);
+    expect(validated.streamingMode).toBe("native");
+    expect(validated.keepAlive).toBe("30m");
+  });
+});
+
+// ════════════════════════════════════════════════════════════════
+// Settings defaults
 // ════════════════════════════════════════════════════════════════
 
 describe("settings defaults", () => {
   it("default streamingMode is 'native'", () => {
-    // Note: readSettings reads from real ~/.pi/agent/settings.json
-    // For unit testing we verify the DEFAULT_SETTINGS object
     const expected: Partial<OllamaSettings> = {
       streamingMode: "native",
       keepAlive: "30m",
       autoPull: true,
     };
-    // These are the documented defaults in the source
     expect(expected.streamingMode).toBe("native");
     expect(expected.keepAlive).toBe("30m");
     expect(expected.autoPull).toBe(true);
@@ -120,6 +295,7 @@ describe("runSetupWizard", () => {
     const pi = mockPi();
     const store = mockAuthStore();
     store.set("ollama", { type: "api_key", key: "old-cloud-key" });
+    store.set("ollama-cloud", { type: "api_key", key: "old-cloud-key" });
 
     const ui = mockUI({ selects: ["Local"], confirms: [true] });
     const ctx = { ui, hasUI: true, modelRegistry: { authStorage: store } } as unknown as ExtensionCommandContext;
@@ -145,12 +321,13 @@ describe("runSetupWizard", () => {
     });
 
     expect(store.remove).toHaveBeenCalledWith("ollama");
+    expect(store.remove).toHaveBeenCalledWith("ollama-cloud");
     expect(configChanged).toBe(true);
     expect(newMode).toBe("local");
     expect(newApiKey).toBe("ollama");
   });
 
-  it("Cloud + API key: saves to authStorage on success", async () => {
+  it("Cloud + API key: saves to authStorage under 'ollama-cloud' key", async () => {
     const pi = mockPi();
     const store = mockAuthStore();
     const ui = mockUI({ selects: ["Cloud", "API key"], inputs: ["my-api-key"] });
@@ -168,7 +345,7 @@ describe("runSetupWizard", () => {
       authStorage: store,
     }, async () => {});
 
-    expect(store.set).toHaveBeenCalledWith("ollama", { type: "api_key", key: "my-api-key" });
+    expect(store.set).toHaveBeenCalledWith("ollama-cloud", { type: "api_key", key: "my-api-key" });
   });
 
   it("Cloud + API key: does NOT save on HTTP failure", async () => {
@@ -190,7 +367,7 @@ describe("runSetupWizard", () => {
     }, async () => {});
 
     expect(store.set).not.toHaveBeenCalledWith(
-      "ollama",
+      "ollama-cloud",
       expect.objectContaining({ key: "bad-key" }),
     );
   });

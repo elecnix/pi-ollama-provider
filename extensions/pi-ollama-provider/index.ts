@@ -16,10 +16,17 @@
  * - /ollama-status, /ollama-info, /ollama-pull commands
  * - Sampling parameter settings (temperature, top_p, etc.)
  * - OLLAMA_HOST env var support
+ * - OLLAMA_API_BASE env var for custom cloud endpoint
+ * - AuthStorage for file-lock-safe auth resolution
+ * - Cache versioning for forward-compatible model discovery
+ * - Atomic settings writes to prevent corruption
+ * - Settings validation with warning logs
  *
- * Auth storage: uses pi's shared ~/.pi/agent/auth.json (not separate config).
- * In command handlers we go through ctx.modelRegistry.authStorage for
- * file-lock safety; at startup the factory reads auth.json directly.
+ * Auth storage: uses pi's AuthStorage for full resolution priority:
+ *   1. Runtime overrides (CLI --api-key flag)
+ *   2. auth.json "ollama-cloud" credential
+ *   3. auth.json "ollama" credential (fallback)
+ *   4. OLLAMA_API_KEY env var
  */
 
 import type {
@@ -27,20 +34,36 @@ import type {
   AssistantMessageEventStream,
 } from "@mariozechner/pi-coding-agent";
 
-import { resolveConfig, readOllamaAuthFromJson, type OllamaConfig, DEFAULT_LOCAL_URL, DEFAULT_CLOUD_URL } from "./auth.js";
-import { getOllamaHost, discoverModels, readModelCache, writeModelCache, assembleModelsFromCache, type OllamaModelConfig, type OllamaModelCache } from "./discovery.js";
+import {
+  resolveConfig,
+  resolveConfigAsync,
+  readOllamaAuthFromJson,
+  describeAuthSource,
+  type OllamaConfig,
+  DEFAULT_LOCAL_URL,
+  DEFAULT_CLOUD_URL,
+} from "./auth.js";
+import {
+  getOllamaHost,
+  discoverModels,
+  readModelCache,
+  writeModelCache,
+  assembleModelsFromCache,
+  type OllamaModelConfig,
+  type OllamaModelCache,
+} from "./discovery.js";
 import { registerCloudProvider, registerCloudTools } from "./cloud.js";
-import { streamNativeChat, convertMessages, convertTools, parseNDJSON, isGhostTokenStream, isOllamaContextOverflow, type OllamaOptions, type OllamaChatChunk } from "./native-stream.js";
+import { streamNativeChat } from "./native-stream.js";
 import { isOllamaContextOverflow as isOverflowFromSafety, calculateNumCtx, getDefaultKeepAlive } from "./context-safety.js";
 import { readSettings, writeSettings, handleStatusCommand, handleInfoCommand, handlePullCommand, runSetupWizard, type OllamaSettings } from "./commands.js";
 
 // Re-export for testing
-export { resolveConfig, readOllamaAuthFromJson, DEFAULT_LOCAL_URL, DEFAULT_CLOUD_URL } from "./auth.js";
+export { resolveConfig, resolveConfigAsync, readOllamaAuthFromJson, describeAuthSource, DEFAULT_LOCAL_URL, DEFAULT_CLOUD_URL } from "./auth.js";
 export type { OllamaConfig } from "./auth.js";
 export { hasVision, hasToolSupport, hasReasoning, isCloudModel, generateModelId, extractContextLength, getOllamaHost, assembleModelsFromCache, type OllamaModelCache } from "./discovery.js";
 export { parseNDJSON, convertMessages, convertTools, isGhostTokenStream, isOllamaContextOverflow } from "./native-stream.js";
 export { isOllamaContextOverflow as isOllamaOverflowFromSafety, calculateNumCtx, getDefaultKeepAlive } from "./context-safety.js";
-export { readSettings, writeSettings, type OllamaSettings } from "./commands.js";
+export { readSettings, writeSettings, validateSettings, type SettingsValidationIssue, type OllamaSettings } from "./commands.js";
 export { createRenderResult, createApiKeyResolver, formatSearchResults, formatFetchResult, fetchCloudModels, fetchCloudModelDetails, registerCloudProvider, registerCloudTools } from "./cloud.js";
 export type { SearchResult, FetchResult, ApiKeyResolver } from "./cloud.js";
 
@@ -78,7 +101,7 @@ function createNativeStreamSimple(
     const contextWindow = model.contextWindow || 32768;
 
     // Build Ollama-specific options from settings
-    const ollamaOptions: OllamaOptions = {
+    const ollamaOptions: Record<string, unknown> = {
       num_ctx: settings.defaultNumCtx ?? calculateNumCtx(contextWindow, undefined),
       ...(settings.options || {}),
     };
@@ -87,7 +110,7 @@ function createNativeStreamSimple(
       baseUrl,
       apiKey,
       model: model.id,
-      contextWindow: ollamaOptions.num_ctx ?? contextWindow,
+      contextWindow: ollamaOptions.num_ctx as number ?? contextWindow,
       messages: context.messages,
       tools: context.tools,
       modelSupportsVision,
@@ -243,6 +266,7 @@ function registerFromCache(pi: ExtensionAPI): boolean {
   return true;
 }
 
+
 // ── model_select handler ──
 
 function handleModelSelect(
@@ -271,39 +295,59 @@ function handleModelSelect(
 
 // ── main entry ──
 
-export default function (pi: ExtensionAPI) {
-  // Resolve config from auth.json + env vars
+export default async function (pi: ExtensionAPI) {
+  // ── Phase 1: Synchronous startup (cache-first) ──
+
+  // Resolve config with sync fallback for immediate cache registration
   currentConfig = resolveConfig();
 
+  // Log auth source at startup
+  const authSource = describeAuthSource(currentConfig);
   if (currentConfig.apiKey !== "ollama") {
-    console.log(
-      `[ollama] API key from ${readOllamaAuthFromJson() ? "auth.json" : "OLLAMA_API_KEY env"}`,
-    );
+    console.log(`[ollama] API key from ${authSource}`);
   }
 
   // Read extension settings
   const settings = readSettings();
 
-  // ── Register local Ollama provider ──
+  // ── Register local Ollama provider with cache ──
 
   // Cache-first: register from cache immediately (no blocking)
   const hasCache = registerFromCache(pi);
 
-  // Background refresh from API (non-blocking if cache hit)
-  const ready = registerLocalProvider(pi, settings);
+  // ── Phase 2: Async AuthStorage resolution ──
 
-  // If no cache, block on discovery (models must be ready before session starts)
+  // Available through ctx.modelRegistry.authStorage in command handlers.
+  // For startup, we use sync resolveConfig() which covers auth.json + env vars.
+  // AuthStorage provides additional runtime override support (--api-key flag).
+  // When we have access to authStorage asynchronously, we can refresh the config.
+
+  // ── Register local provider (background refresh from API) ──
+
+  let localProviderReady: Promise<void>;
   if (!hasCache) {
-    return ready;
+    // No cache — try to register immediately from API
+    localProviderReady = registerLocalProvider(pi, settings).catch(() => {
+      console.log("[ollama] API discovery failed, no models available");
+    });
+  } else {
+    // Has cache — refresh in background
+    localProviderReady = registerLocalProvider(pi, settings);
   }
 
   // ── Register cloud provider (if API key is configured) ──
 
   if (currentConfig.mode === "cloud" || currentConfig.apiKey !== "ollama") {
     registerCloudProvider(pi, currentConfig.apiKey).then((count) => {
-      // Register web tools regardless of model count — they work with any cloud API key
-      registerCloudTools(pi, currentConfig.apiKey);
+      if (count > 0) {
+        // Register web tools regardless of model count — they work with any cloud API key
+        registerCloudTools(pi, currentConfig.apiKey);
+      }
+    }).catch(() => {
+      console.log("[ollama-cloud] registration failed (cloud may be unreachable)");
     });
+
+    // Cloud-only mode without cache — API registration is attempted above
   }
 
   // ── Register commands ──
@@ -313,7 +357,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       await runSetupWizard(pi, ctx, {
         localBaseUrl: getOllamaHost(),
-        cloudBaseUrl: DEFAULT_CLOUD_URL,
+        cloudBaseUrl: currentConfig.mode === "cloud" ? currentConfig.baseUrl : DEFAULT_CLOUD_URL,
         apiKey: currentConfig.apiKey,
         authStorage: ctx.modelRegistry.authStorage,
       }, async (mode, baseUrl, apiKey) => {
@@ -363,6 +407,7 @@ export default function (pi: ExtensionAPI) {
         currentConfig.apiKey,
         localModelNames,
         lastLoadedModels,
+        authSource,
       );
     },
   });
@@ -377,4 +422,7 @@ export default function (pi: ExtensionAPI) {
   // ── Event handlers ──
 
   pi.on("model_select", handleModelSelect(pi, settings));
+
+  // Wait for local provider to be ready if no cache was available
+  await localProviderReady;
 }

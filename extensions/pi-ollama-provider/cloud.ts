@@ -28,7 +28,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const CLOUD_PROVIDER_NAME = "ollama-cloud";
-const CLOUD_BASE_URL = "https://ollama.com";
+
+/** Cloud base URL, configurable via OLLAMA_API_BASE env var */
+export const CLOUD_BASE_URL = (process.env.OLLAMA_API_BASE?.replace(/\/+$/, "") || "https://ollama.com");
 
 /** Web tools enabled by default; disable via PI_OLLAMA_WEB_TOOLS=0 or false */
 const WEB_TOOLS_DISABLED =

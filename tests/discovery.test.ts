@@ -1,9 +1,10 @@
 /**
- * Tests for discovery.ts — model discovery, capability inference, cache.
+ * Tests for discovery.ts — model discovery, capability inference, cache,
+ * cache, and OLLAMA_API_BASE.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -15,8 +16,156 @@ import {
   isCloudModel,
   generateModelId,
   getOllamaHost,
-  parseNDJSON,
+  assembleModelsFromCache,
+  type OllamaModelConfig,
+  type OllamaModelCache,
+  type OllamaTagsModel,
 } from "../extensions/pi-ollama-provider/index.js";
+
+import {
+  readModelCache,
+  writeModelCache,
+  CACHE_PATH,
+} from "../extensions/pi-ollama-provider/discovery.js";
+
+// ════════════════════════════════════════════════════════════════
+// Cache v2 format (raw API responses)
+// ════════════════════════════════════════════════════════════════
+
+describe("readModelCache / writeModelCache", () => {
+  beforeEach(() => {
+    // Clean up any existing cache
+    try { rmSync(CACHE_PATH, { force: true }); } catch {}
+  });
+
+  afterEach(() => {
+    try { rmSync(CACHE_PATH, { force: true }); } catch {}
+  });
+
+  it("writeModelCache creates v2 format with tagsModels and showResponses", () => {
+    const tagsModels: OllamaTagsModel[] = [
+      {
+        name: "llama3.1:8b",
+        model: "llama3.1:8b",
+        modified_at: "2025-01-01T00:00:00Z",
+        size: 4661224676,
+        digest: "abc123",
+        details: { family: "llama3.1", capabilities: ["tools"] },
+      },
+    ];
+
+    const cache: OllamaModelCache = {
+      version: 2,
+      timestamp: Date.now(),
+      tagsModels,
+      showResponses: {
+        "llama3.1:8b": {
+          details: { family: "llama3.1", capabilities: ["tools"] },
+          model_info: { "llama.context_length": 131072 },
+        },
+      },
+      mode: "local",
+    };
+
+    writeModelCache(cache);
+
+    const readBack = readModelCache();
+    expect(readBack).not.toBeNull();
+    expect(readBack!.version).toBe(2);
+    expect(readBack!.tagsModels.length).toBe(1);
+    expect(readBack!.tagsModels[0].name).toBe("llama3.1:8b");
+    expect(readBack!.mode).toBe("local");
+  });
+
+  it("readModelCache returns null when cache file doesn't exist", () => {
+    try { rmSync(CACHE_PATH, { force: true }); } catch {}
+    const result = readModelCache();
+    expect(result).toBeNull();
+  });
+
+  it("readModelCache discards v1 (plain array) format", () => {
+    // v1 format is a plain array of processed configs
+    const v1Cache = [
+      {
+        id: "llama3.1:8b",
+        name: "llama3.1:8b",
+        reasoning: false,
+        input: ["text"],
+        contextWindow: 131072,
+        maxTokens: 32768,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        toolSupport: true,
+        isCloud: false,
+        ollamaName: "llama3.1:8b",
+      },
+    ];
+
+    mkdirSync(join(CACHE_PATH, ".."), { recursive: true });
+    writeFileSync(CACHE_PATH, JSON.stringify(v1Cache, null, 2));
+
+    const cached = readModelCache();
+    expect(cached).toBeNull(); // v1 is discarded, not migrated
+  });
+
+  it("readModelCache discards unknown version", () => {
+    const unknownCache = { version: 99, timestamp: Date.now(), tagsModels: [], showResponses: {} };
+    mkdirSync(join(CACHE_PATH, ".."), { recursive: true });
+    writeFileSync(CACHE_PATH, JSON.stringify(unknownCache, null, 2));
+
+    const cached = readModelCache();
+    expect(cached).toBeNull();
+  });
+
+  it("writeModelCache produces v2 format with version and timestamp", () => {
+    const cache: OllamaModelCache = {
+      version: 2,
+      timestamp: Date.now(),
+      tagsModels: [],
+      showResponses: {},
+      mode: "local",
+    };
+
+    writeModelCache(cache);
+
+    mkdirSync(join(CACHE_PATH, ".."), { recursive: true });
+    const raw = JSON.parse(readFileSync(CACHE_PATH, "utf-8"));
+    expect(raw.version).toBe(2);
+    expect(raw.timestamp).toBeTypeOf("number");
+    expect(raw.mode).toBe("local");
+
+    rmSync(CACHE_PATH, { force: true });
+  });
+
+  it("assembleModelsFromCache produces valid model configs", () => {
+    const cache: OllamaModelCache = {
+      version: 2,
+      timestamp: Date.now(),
+      tagsModels: [
+        {
+          name: "llama3.1:8b",
+          model: "llama3.1:8b",
+          modified_at: "2025-01-01T00:00:00Z",
+          size: 4661224676,
+          digest: "abc123",
+          details: { family: "llama3.1", capabilities: ["tools"] },
+        },
+      ],
+      showResponses: {
+        "llama3.1:8b": {
+          details: { family: "llama3.1", capabilities: ["tools"] },
+          model_info: { "llama.context_length": 131072 },
+        },
+      },
+      mode: "local",
+    };
+
+    const configs = assembleModelsFromCache(cache, "local");
+    expect(configs.length).toBe(1);
+    expect(configs[0].id).toBe("llama3.1:8b");
+    expect(configs[0].toolSupport).toBe(true);
+    expect(configs[0].contextWindow).toBe(131072);
+  });
+});
 
 // ════════════════════════════════════════════════════════════════
 // hasVision
@@ -63,7 +212,7 @@ describe("hasToolSupport", () => {
     expect(hasToolSupport(["tools", "vision"], {})).toBe(true);
   });
 
-  it("detects from known families", () => {
+  it("detects from known family", () => {
     expect(hasToolSupport([], {}, "llama3.1")).toBe(true);
     expect(hasToolSupport([], {}, "qwen2.5")).toBe(true);
     expect(hasToolSupport([], {}, "gemma4")).toBe(true);

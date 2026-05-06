@@ -5,6 +5,15 @@
  *   1. Cache-first — read from ~/.pi/agent/ollama-models-cache.json (instant, no network)
  *   2. Fresh API — GET /api/tags + POST /api/show per model (background refresh)
  *
+ * Cold-start fallback:
+ *   If no cache exists and Ollama is unreachable, FALLBACK_MODELS are registered
+ *   so the user always has at least some models to select.
+ *
+ * Cache format:
+ *   v1 (legacy): plain array of OllamaModelConfig[] — discarded gracefully
+ *   v2: { version: 2, timestamp, tagsModels, showResponses, mode }
+ *   v2 stores raw API responses so cache can be re-processed without re-fetching.
+ *
  * Capability inference:
  *   - Tool support: capabilities.includes("tools") or known tool-capable families
  *   - Vision: capabilities.includes("vision"), CLIP flag, or known vision architectures
@@ -79,6 +88,31 @@ export interface OllamaShowResponse {
   };
   model_info?: Record<string, unknown>;
   capabilities?: string[];
+}
+
+// ── cache format ──
+
+/** Cache format version — bump when schema changes to invalidate old caches. */
+const CACHE_VERSION = 2;
+
+/**
+ * On-disk cache format v2: raw /api/tags and /api/show responses.
+ *
+ * Storing raw API data (instead of processed configs) means:
+ * - Cache can be re-processed without re-fetching (e.g., if capability inference changes)
+ * - Raw data is better for debugging — inspect actual API responses
+ * - Forward compatible — new fields from newer Ollama versions are preserved
+ * - Backward compatible — v1 (flat array) caches are detected and gracefully discarded
+ */
+export interface OllamaModelCache {
+  version: number;
+  timestamp: number;
+  /** Raw /api/tags response models */
+  tagsModels: OllamaTagsModel[];
+  /** Raw /api/show responses keyed by model name */
+  showResponses: Record<string, OllamaShowResponse | null>;
+  /** Config mode at time of caching ("local" or "cloud") */
+  mode: "local" | "cloud";
 }
 
 // ── constants ──
@@ -267,29 +301,6 @@ export function generateModelId(modelName: string, isCloud: boolean): string {
 }
 
 // ── cache ──
-
-/** Cache format version — bump when schema changes to invalidate old caches. */
-const CACHE_VERSION = 2;
-
-/**
- * On-disk cache format v2: raw /api/tags and /api/show responses.
- *
- * Storing raw API data (instead of processed configs) means:
- * - Cache can be re-processed without re-fetching (e.g., if capability inference changes)
- * - Raw data is better for debugging — inspect actual API responses
- * - Forward compatible — new fields from newer Ollama versions are preserved
- * - Backward compatible — v1 (flat array) caches are detected and gracefully discarded
- */
-export interface OllamaModelCache {
-  version: number;
-  timestamp: number;
-  /** Raw /api/tags response models */
-  tagsModels: OllamaTagsModel[];
-  /** Raw /api/show responses keyed by model name */
-  showResponses: Record<string, OllamaShowResponse | null>;
-  /** Config mode at time of caching ("local" or "cloud") */
-  mode: "local" | "cloud";
-}
 
 /**
  * Read the raw cache from disk.
