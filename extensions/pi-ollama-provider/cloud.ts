@@ -3,25 +3,103 @@
  *
  * Connects Pi directly to ollama.com/v1 (no local server needed).
  * Filters to only tool-capable models (coding agent requires tools).
- * Includes web_search and web_fetch tools powered by Ollama Cloud API.
+ * Includes ollama_web_search and ollama_web_fetch tools with rich TUI rendering.
+ *
+ * Improvements over v2.0 (issue #8):
+ *   - renderResult for collapsible, theme-aware, visually truncated tool output
+ *   - max_results parameter for web search (1-10, default 5)
+ *   - Structured error handling with isError flag
+ *   - details field for structured result data alongside human-readable content
+ *   - Web tools enabled by default (opt-out via PI_OLLAMA_WEB_TOOLS=0)
+ *   - API key retrieval via AuthStorage in tool execute context (file-lock safe)
+ *   - TypeBox parameter schemas
  *
  * Authentication:
  *   - OLLAMA_API_KEY env var
- *   - auth.json "ollama-cloud" credential
+ *   - auth.json "ollama-cloud" / "ollama" credential
  *   - Fallback: prompt user via /ollama-setup
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
+import { keyHint, truncateToVisualLines } from "@mariozechner/pi-coding-agent";
+import { Text, truncateToWidth } from "@mariozechner/pi-tui";
+import { Type } from "@sinclair/typebox";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const CLOUD_PROVIDER_NAME = "ollama-cloud";
 const CLOUD_BASE_URL = "https://ollama.com";
 
-/** Web search/fetch tools disabled by default; enable via PI_OLLAMA_WEB_TOOLS=1 */
-const WEB_TOOLS_ENABLED =
-  process.env.PI_OLLAMA_WEB_TOOLS === "1" ||
-  process.env.PI_OLLAMA_WEB_TOOLS === "true";
+/** Web tools enabled by default; disable via PI_OLLAMA_WEB_TOOLS=0 or false */
+const WEB_TOOLS_DISABLED =
+  process.env.PI_OLLAMA_WEB_TOOLS === "0" ||
+  process.env.PI_OLLAMA_WEB_TOOLS === "false";
+
+// ── TUI rendering ──
+
+/** Number of visual lines to show in collapsed mode */
+const PREVIEW_LINES = 8;
+
+/**
+ * Build a renderResult handler that shows a truncated preview when collapsed
+ * and the full output when expanded. Follows the bash tool pattern from pi core.
+ *
+ * Handles:
+ * - Collapsed: shows last N visual lines with "N earlier lines, expand to see all" hint
+ * - Expanded: shows full output with theme-aware coloring
+ * - Errors: always expanded with error styling
+ */
+export function createRenderResult() {
+  return (
+    result: { content: Array<{ type: string; text: string }>; isError?: boolean },
+    options: { expanded: boolean; isPartial: boolean },
+    theme: Theme,
+    context: {
+      invalidate: () => void;
+      lastComponent: import("@mariozechner/pi-tui").Component | undefined;
+      state: { cachedWidth?: number; cachedLines?: string[]; cachedSkipped?: number };
+    },
+  ) => {
+    const state = context.state;
+    const output = result.content
+      .map((c) => c.text)
+      .join("")
+      .trim();
+    const styledOutput = output
+      .split("\n")
+      .map((line: string) => theme.fg("toolOutput", line))
+      .join("\n");
+
+    if (options.expanded || result.isError) {
+      const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      text.setText(result.isError ? styledOutput : `\n${styledOutput}`);
+      return text;
+    }
+
+    return {
+      render: (width: number) => {
+        if (state.cachedWidth !== width) {
+          const preview = truncateToVisualLines(styledOutput, PREVIEW_LINES, width);
+          state.cachedLines = preview.visualLines;
+          state.cachedSkipped = preview.skippedCount;
+          state.cachedWidth = width;
+        }
+        if (state.cachedSkipped && state.cachedSkipped > 0) {
+          const hint =
+            theme.fg("muted", `... (${state.cachedSkipped} earlier lines,`) +
+            ` ${keyHint("app.tools.expand", "to expand")})`;
+          return ["", truncateToWidth(hint, width, "..."), ...(state.cachedLines ?? [])];
+        }
+        return ["", ...(state.cachedLines ?? [])];
+      },
+      invalidate: () => {
+        state.cachedWidth = undefined;
+        state.cachedLines = undefined;
+        state.cachedSkipped = undefined;
+      },
+    };
+  };
+}
 
 // ── cloud model discovery ──
 
@@ -169,98 +247,324 @@ export async function registerCloudProvider(
   return modelConfigs.length;
 }
 
+// ── API key resolution ──
+
+export interface ApiKeyResolver {
+  getApiKey(): Promise<string | undefined>;
+}
+
+/**
+ * Create an API key resolver that checks AuthStorage first, then env var.
+ * This is the recommended pattern (file-lock safe, follows pi convention).
+ */
+export function createApiKeyResolver(
+  authStorage: { getApiKeyForProvider?: (provider: string) => string | undefined | Promise<string | undefined>; getApiKey?: (provider: string) => string | undefined | Promise<string | undefined> },
+): ApiKeyResolver {
+  return {
+    async getApiKey() {
+      // Try AuthStorage first (supports getApiKeyForProvider or getApiKey)
+      try {
+        if (typeof authStorage.getApiKeyForProvider === "function") {
+          const key = await authStorage.getApiKeyForProvider("ollama-cloud");
+          if (key) return key;
+        }
+        if (typeof authStorage.getApiKey === "function") {
+          const key = await authStorage.getApiKey("ollama-cloud");
+          if (key) return key;
+          // Also try just "ollama" key
+          const ollamaKey = await authStorage.getApiKey("ollama");
+          if (ollamaKey && ollamaKey !== "ollama") return ollamaKey;
+        }
+      } catch {
+        // AuthStorage not available, fall through
+      }
+
+      // Fallback to OLLAMA_API_KEY env var
+      const envKey = process.env.OLLAMA_API_KEY;
+      if (envKey) return envKey;
+
+      return undefined;
+    },
+  };
+}
+
+function noApiKeyError() {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: "Error: No Ollama Cloud API key configured. Set OLLAMA_API_KEY or run /ollama-setup.",
+      },
+    ],
+    isError: true,
+  };
+}
+
+// ── result formatting ──
+
+export interface SearchResult {
+  title: string;
+  url: string;
+  content: string;
+}
+
+export interface FetchResult {
+  title: string;
+  content: string;
+  links: string[];
+}
+
+export function formatSearchResults(results: SearchResult[]): string {
+  if (results.length === 0) return "No results found.";
+  return results
+    .map((r, i) => `${i + 1}. ${r.title}\n   URL: ${r.url}\n   ${r.content}`)
+    .join("\n\n");
+}
+
+export function formatFetchResult(data: FetchResult): string {
+  const lines: string[] = [
+    `Title: ${data.title}`,
+    "",
+    "Content:",
+    data.content,
+  ];
+
+  if (data.links && data.links.length > 0) {
+    lines.push("", `Links found: ${data.links.length}`);
+    for (const l of data.links.slice(0, 10)) {
+      lines.push(`  - ${l}`);
+    }
+    if (data.links.length > 10) {
+      lines.push(`  ... and ${data.links.length - 10} more`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
 // ── web search/fetch tools ──
 
 /**
- * Register web_search and web_fetch tools for Ollama Cloud.
+ * Register ollama_web_search and ollama_web_fetch tools for Ollama Cloud.
  * These use Ollama Cloud's hosted web_search and web_fetch endpoints,
  * which are only available for cloud models.
  *
  * Tool names are prefixed with "ollama_" to avoid collision with
  * any other web search extensions the user may have installed.
+ *
+ * Web tools are enabled by default. Set PI_OLLAMA_WEB_TOOLS=0 to disable.
  */
 export function registerCloudTools(pi: ExtensionAPI, apiKey: string): void {
-  if (!WEB_TOOLS_ENABLED) return;
+  if (WEB_TOOLS_DISABLED) {
+    console.log("[ollama-cloud] web tools disabled (PI_OLLAMA_WEB_TOOLS=0)");
+    return;
+  }
+
+  const renderResult = createRenderResult();
+
+  // Shared API key resolver — uses module-level apiKey as fallback
+  const fallbackResolver: ApiKeyResolver = {
+    async getApiKey() {
+      // Module-level apiKey from registerCloudTools (from auth.json / env var)
+      if (apiKey && apiKey !== "ollama") return apiKey;
+      const envKey = process.env.OLLAMA_API_KEY;
+      if (envKey) return envKey;
+      return undefined;
+    },
+  };
+
+  // ── ollama_web_search ──
 
   pi.registerTool({
     name: "ollama_web_search",
+    label: "Ollama Web Search",
     description:
-      "Search the web using Ollama Cloud. Returns relevant search results.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description: "Search query",
-        },
-      },
-      required: ["query"],
-    },
-    execute: async (args: Record<string, unknown>) => {
-      const query = String(args.query ?? "");
-      if (!query) return "Error: empty query";
+      "Search the web for real-time information using Ollama Cloud's web search API. " +
+      "Returns relevant results with titles, URLs, and content snippets. " +
+      "Requires an Ollama Cloud API key.",
+    parameters: Type.Object({
+      query: Type.String({ description: "The search query to execute" }),
+      max_results: Type.Optional(
+        Type.Integer({
+          description: "Maximum number of search results to return (default: 5, max: 10)",
+          default: 5,
+          minimum: 1,
+          maximum: 10,
+        }),
+      ),
+    }),
+    async execute(
+      _toolCallId: string,
+      params: { query: string; max_results?: number },
+      signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      ctx: { modelRegistry?: { authStorage?: any } },
+    ) {
+      // Resolve API key: try AuthStorage from context first, then fallback
+      let resolvedApiKey: string | undefined;
+
+      if (ctx?.modelRegistry?.authStorage) {
+        const resolver = createApiKeyResolver(ctx.modelRegistry.authStorage);
+        resolvedApiKey = await resolver.getApiKey();
+      }
+
+      if (!resolvedApiKey) {
+        resolvedApiKey = await fallbackResolver.getApiKey();
+      }
+
+      if (!resolvedApiKey) return noApiKeyError();
+
+      const query = String(params.query ?? "");
+      if (!query) {
+        return {
+          content: [{ type: "text" as const, text: "Error: empty query" }],
+          isError: true,
+        };
+      }
+
+      const maxResults = Math.min(Math.max(params.max_results ?? 5, 1), 10);
 
       try {
         const res = await fetch(`${CLOUD_BASE_URL}/api/web_search`, {
           method: "POST",
           headers: {
-            Authorization: `Bearer ${apiKey}`,
+            Authorization: `Bearer ${resolvedApiKey}`,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ query }),
+          body: JSON.stringify({ query, max_results: maxResults }),
+          signal,
         });
 
         if (!res.ok) {
-          return `Web search failed: HTTP ${res.status}`;
+          const errorText = await res.text().catch(() => "");
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Search API error (status ${res.status}): ${errorText || res.statusText}`,
+              },
+            ],
+            isError: true,
+          };
         }
 
         const data = await res.json();
-        return JSON.stringify(data, null, 2);
+        const results: SearchResult[] = data.results || [];
+        const formatted = formatSearchResults(results);
+
+        return {
+          content: [{ type: "text" as const, text: formatted }],
+          details: { results },
+        };
       } catch (err) {
-        return `Web search error: ${err instanceof Error ? err.message : String(err)}`;
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Web search failed: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
       }
     },
+    renderResult,
   });
+
+  // ── ollama_web_fetch ──
 
   pi.registerTool({
     name: "ollama_web_fetch",
+    label: "Ollama Web Fetch",
     description:
-      "Fetch and extract content from a web page URL using Ollama Cloud.",
-    parameters: {
-      type: "object",
-      properties: {
-        url: {
-          type: "string",
-          description: "URL to fetch",
-        },
-      },
-      required: ["url"],
-    },
-    execute: async (args: Record<string, unknown>) => {
-      const url = String(args.url ?? "");
-      if (!url) return "Error: empty URL";
+      "Fetch and extract text content from a web page URL using Ollama Cloud's web fetch API. " +
+      "Returns the page title, main content, and links found on the page. " +
+      "Requires an Ollama Cloud API key.",
+    parameters: Type.Object({
+      url: Type.String({
+        description: "URL to fetch and extract content from",
+        format: "uri",
+      }),
+    }),
+    async execute(
+      _toolCallId: string,
+      params: { url: string },
+      signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      ctx: { modelRegistry?: { authStorage?: any } },
+    ) {
+      // Resolve API key: try AuthStorage from context first, then fallback
+      let resolvedApiKey: string | undefined;
+
+      if (ctx?.modelRegistry?.authStorage) {
+        const resolver = createApiKeyResolver(ctx.modelRegistry.authStorage);
+        resolvedApiKey = await resolver.getApiKey();
+      }
+
+      if (!resolvedApiKey) {
+        resolvedApiKey = await fallbackResolver.getApiKey();
+      }
+
+      if (!resolvedApiKey) return noApiKeyError();
+
+      const url = String(params.url ?? "");
+      if (!url) {
+        return {
+          content: [{ type: "text" as const, text: "Error: empty URL" }],
+          isError: true,
+        };
+      }
 
       try {
         const res = await fetch(`${CLOUD_BASE_URL}/api/web_fetch`, {
           method: "POST",
           headers: {
-            Authorization: `Bearer ${apiKey}`,
+            Authorization: `Bearer ${resolvedApiKey}`,
             "Content-Type": "application/json",
           },
           body: JSON.stringify({ url }),
+          signal,
         });
 
         if (!res.ok) {
-          return `Web fetch failed: HTTP ${res.status}`;
+          const errorText = await res.text().catch(() => "");
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Fetch API error (status ${res.status}): ${errorText || res.statusText}`,
+              },
+            ],
+            isError: true,
+          };
         }
 
         const data = await res.json();
-        return JSON.stringify(data, null, 2);
+        const fetchResult: FetchResult = {
+          title: data.title || url,
+          content: data.content || "",
+          links: data.links || [],
+        };
+        const formatted = formatFetchResult(fetchResult);
+
+        return {
+          content: [{ type: "text" as const, text: formatted }],
+          details: { title: fetchResult.title, content: fetchResult.content, links: fetchResult.links },
+        };
       } catch (err) {
-        return `Web fetch error: ${err instanceof Error ? err.message : String(err)}`;
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Web fetch failed: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
       }
     },
+    renderResult,
   });
 
-  console.log("[ollama-cloud] web_search + web_fetch tools registered");
+  console.log("[ollama-cloud] ollama_web_search + ollama_web_fetch tools registered (enabled by default)");
 }

@@ -411,7 +411,7 @@ export async function streamNativeChat(
           hasContent = true;
           if (thinkingActive) {
             // Close thinking block before text
-            stream.pushThinkingDelta("");
+            stream.pushThinkingDelta?.("");
             thinkingActive = false;
           }
           stream.pushTextDelta(chunk.message.content);
@@ -422,14 +422,14 @@ export async function streamNativeChat(
           if (!thinkingActive) {
             thinkingActive = true;
           }
-          stream.pushThinkingDelta(chunk.message.thinking);
+          stream.pushThinkingDelta?.(chunk.message.thinking);
         }
 
         // Tool calls — emit as a complete burst
         if (chunk.message.tool_calls && chunk.message.tool_calls.length > 0) {
           hasToolCalls = true;
           if (thinkingActive) {
-            stream.pushThinkingDelta("");
+            stream.pushThinkingDelta?.("");
             thinkingActive = false;
           }
           for (const tc of chunk.message.tool_calls) {
@@ -445,7 +445,7 @@ export async function streamNativeChat(
       if (chunk.done) {
         // Close any open thinking block
         if (thinkingActive) {
-          stream.pushThinkingDelta("");
+          stream.pushThinkingDelta?.("");
           thinkingActive = false;
         }
 
@@ -525,8 +525,8 @@ async function retryNonStreaming(
       stream.pushTextDelta(result.message.content);
     }
     if (result.message.thinking) {
-      stream.pushThinkingDelta(result.message.thinking);
-      stream.pushThinkingDelta(""); // close thinking
+      stream.pushThinkingDelta?.(result.message.thinking);
+      stream.pushThinkingDelta?.(""); // close thinking
     }
     if (result.message.tool_calls && result.message.tool_calls.length > 0) {
       for (const tc of result.message.tool_calls) {

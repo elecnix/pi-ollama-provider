@@ -41,6 +41,8 @@ export { hasVision, hasToolSupport, hasReasoning, isCloudModel, generateModelId,
 export { parseNDJSON, convertMessages, convertTools, isGhostTokenStream, isOllamaContextOverflow } from "./native-stream.js";
 export { isOllamaContextOverflow as isOllamaOverflowFromSafety, calculateNumCtx, getDefaultKeepAlive } from "./context-safety.js";
 export { readSettings, writeSettings, type OllamaSettings } from "./commands.js";
+export { createRenderResult, createApiKeyResolver, formatSearchResults, formatFetchResult, fetchCloudModels, fetchCloudModelDetails, registerCloudProvider, registerCloudTools } from "./cloud.js";
+export type { SearchResult, FetchResult, ApiKeyResolver } from "./cloud.js";
 
 const LOCAL_PROVIDER_NAME = "ollama";
 const CLOUD_PROVIDER_NAME = "ollama-cloud";
@@ -299,9 +301,8 @@ export default function (pi: ExtensionAPI) {
 
   if (currentConfig.mode === "cloud" || currentConfig.apiKey !== "ollama") {
     registerCloudProvider(pi, currentConfig.apiKey).then((count) => {
-      if (count > 0) {
-        registerCloudTools(pi, currentConfig.apiKey);
-      }
+      // Register web tools regardless of model count — they work with any cloud API key
+      registerCloudTools(pi, currentConfig.apiKey);
     });
   }
 
