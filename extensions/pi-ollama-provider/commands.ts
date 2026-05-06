@@ -5,12 +5,8 @@
  * This avoids needing a separate config file while giving users control
  * over Ollama-specific options (temperature, num_ctx, top_p, etc.).
  *
- * Settings schema versioning: v2 adds a "version" field for forward compat.
- * On read, if the version is missing (v1) or incompatible, defaults are applied.
- *
  * Atomic writes: writeSettings uses a temp file + rename pattern to prevent
  * corruption if pi crashes mid-write.
- *
  * Commands:
  *   /ollama-setup   — Interactive setup wizard (local or cloud)
  *   /ollama-refresh  — Re-discover models
@@ -22,17 +18,13 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { readFileSync, writeFileSync, existsSync, renameSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 
 const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
-const SETTINGS_VERSION = 1;
 
 // ── settings ──
 
 export interface OllamaSettings {
-  /** Schema version for forward compatibility */
-  version?: number;
   /** Default num_ctx for all models (default: model's context_length from /api/show) */
   defaultNumCtx?: number;
   /** Default keep_alive (default: "30m") */
@@ -53,7 +45,6 @@ export interface OllamaSettings {
 }
 
 const DEFAULT_SETTINGS: OllamaSettings = {
-  version: SETTINGS_VERSION,
   keepAlive: "30m",
   streamingMode: "native",
   autoPull: true,
@@ -174,9 +165,6 @@ export function validateSettings(settings: Partial<OllamaSettings>): {
     validated.autoPull = true;
   }
 
-  // Ensure version is set
-  validated.version = SETTINGS_VERSION;
-
   return { validated, issues };
 }
 
@@ -190,13 +178,6 @@ export function readSettings(): OllamaSettings {
     const data = readFileSync(SETTINGS_PATH, "utf-8");
     const parsed = JSON.parse(data);
     const ollamaSection = parsed?.ollama ?? {};
-
-    // Check version — if missing or incompatible, use defaults
-    if (ollamaSection.version !== undefined && ollamaSection.version > SETTINGS_VERSION) {
-      console.log(
-        `[ollama] settings version ${ollamaSection.version} is newer than supported (${SETTINGS_VERSION}), using defaults for unknown keys`,
-      );
-    }
 
     const { validated, issues } = validateSettings(ollamaSection);
 

@@ -197,15 +197,14 @@ describe("validateSettings", () => {
     expect(validated.autoPull).toBe(true);
   });
 
-  it("sets version in validated settings", () => {
+  it("merges empty settings with defaults", () => {
     const { validated } = validateSettings({});
-    expect(validated.version).toBe(1);
+    expect(validated.streamingMode).toBe("native");
   });
 
   it("handles empty settings object", () => {
     const { validated, issues } = validateSettings({});
     expect(issues).toHaveLength(0);
-    expect(validated.version).toBe(1);
     expect(validated.streamingMode).toBe("native");
     expect(validated.keepAlive).toBe("30m");
   });

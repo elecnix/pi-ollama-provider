@@ -141,7 +141,7 @@ describe("Auth new features integration", () => {
   it("validateSettings is callable and returns valid defaults", () => {
     const { validated, issues } = validateSettings({});
     expect(validated.streamingMode).toBe("native");
-    expect(validated.version).toBe(1);
+    expect(validated.streamingMode).toBe("native");
     expect(issues).toHaveLength(0);
   });
 });

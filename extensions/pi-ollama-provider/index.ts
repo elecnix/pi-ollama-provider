@@ -18,7 +18,7 @@
  * - OLLAMA_HOST env var support
  * - OLLAMA_API_BASE env var for custom cloud endpoint
  * - AuthStorage for file-lock-safe auth resolution
- * - Schema versioning for settings and cache
+ * - Cache versioning for forward-compatible model discovery
  * - Atomic settings writes to prevent corruption
  * - Settings validation with warning logs
  *
