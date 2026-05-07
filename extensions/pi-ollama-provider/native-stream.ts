@@ -14,7 +14,7 @@
  * - Fallback to OpenAI compat /v1/chat/completions if native fails
  */
 
-import type { AssistantMessageEventStream } from "@mariozechner/pi-coding-agent";
+import type { AssistantMessageEventStream } from "@mariozechner/pi-ai";
 import { Readable } from "node:stream";
 
 // ── types ──
@@ -354,11 +354,33 @@ export async function streamNativeChat(
     ...(keepAlive ? { keep_alive: keepAlive } : {}),
   };
 
+  // Build the output message that will be updated
+  const output: any = {
+    role: "assistant",
+    content: [],
+    api: "openai-completions",
+    provider: "ollama",
+    model: model,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  };
+
+  // Track content indices for proper delta ordering
+  let textIndex = 0;
+  let thinkingIndex = 0;
+  let toolCallIndex = 0;
+  let hasToolCalls = false;
+
   // Collect chunks for ghost-token detection
   const chunks: OllamaChatChunk[] = [];
-  let hasContent = false;
-  let hasToolCalls = false;
-  let thinkingActive = false;
 
   try {
     const response = await fetch(`${baseUrl}/api/chat`, {
@@ -388,6 +410,9 @@ export async function streamNativeChat(
       throw new Error("[ollama] /api/chat returned empty body");
     }
 
+    // Push start event
+    stream.push({ type: "start", partial: output });
+
     for await (const chunk of parseNDJSON(response.body as ReadableStream<Uint8Array>)) {
       if (signal?.aborted) break;
 
@@ -408,68 +433,73 @@ export async function streamNativeChat(
       if (chunk.message) {
         // Text content
         if (chunk.message.content) {
-          hasContent = true;
-          if (thinkingActive) {
-            // Close thinking block before text
-            stream.pushThinkingDelta?.("");
-            thinkingActive = false;
+          // Start text content block if needed
+          const textBlock = { type: "text", text: chunk.message.content };
+          output.content.push(textBlock);
+          stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
+          stream.push({ type: "text_delta", contentIndex: textIndex, delta: chunk.message.content, partial: output });
+          stream.push({ type: "text_end", contentIndex: textIndex, content: chunk.message.content, partial: output });
+          textIndex++;
+
+          if (thinkingIndex > 0) {
+            // Close any open thinking block
+            stream.push({ type: "thinking_end", contentIndex: thinkingIndex - 1, content: "", partial: output });
           }
-          stream.pushTextDelta(chunk.message.content);
         }
 
         // Thinking content
         if (chunk.message.thinking) {
-          if (!thinkingActive) {
-            thinkingActive = true;
-          }
-          stream.pushThinkingDelta?.(chunk.message.thinking);
+          const thinkingBlock = { type: "thinking", thinking: chunk.message.thinking };
+          output.content.push(thinkingBlock);
+          stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: output });
+          stream.push({ type: "thinking_delta", contentIndex: thinkingIndex, delta: chunk.message.thinking, partial: output });
+          stream.push({ type: "thinking_end", contentIndex: thinkingIndex, content: chunk.message.thinking, partial: output });
+          thinkingIndex++;
         }
 
         // Tool calls — emit as a complete burst
         if (chunk.message.tool_calls && chunk.message.tool_calls.length > 0) {
-          hasToolCalls = true;
-          if (thinkingActive) {
-            stream.pushThinkingDelta?.("");
-            thinkingActive = false;
+          // Close any open thinking block
+          if (thinkingIndex > 0) {
+            const lastThinkingIdx = thinkingIndex - 1;
+            stream.push({ type: "thinking_end", contentIndex: lastThinkingIdx, content: "", partial: output });
           }
+
           for (const tc of chunk.message.tool_calls) {
-            stream.pushToolCall(
-              tc.function.name,
-              JSON.stringify(tc.function.arguments),
-            );
+            const toolCallBlock = {
+              type: "toolCall",
+              id: `tool_${toolCallIndex}`,
+              name: tc.function.name,
+              arguments: tc.function.arguments,
+            };
+            output.content.push(toolCallBlock);
+            stream.push({ type: "toolcall_start", contentIndex: toolCallIndex, partial: output });
+            stream.push({ type: "toolcall_delta", contentIndex: toolCallIndex, delta: JSON.stringify(tc.function.arguments), partial: output });
+            stream.push({ type: "toolcall_end", contentIndex: toolCallIndex, toolCall: toolCallBlock, partial: output });
+            hasToolCalls = true;
+            toolCallIndex++;
           }
         }
       }
 
       // Final chunk — emit usage and finish
       if (chunk.done) {
-        // Close any open thinking block
-        if (thinkingActive) {
-          stream.pushThinkingDelta?.("");
-          thinkingActive = false;
-        }
+        output.usage.input = chunk.prompt_eval_count ?? 0;
+        output.usage.output = chunk.eval_count ?? 0;
+        output.usage.totalTokens = output.usage.input + output.usage.output;
+        output.stopReason = hasToolCalls ? "toolUse" : (chunk.done_reason === "length" ? "length" : "stop");
 
-        stream.pushUsage({
-          inputTokens: chunk.prompt_eval_count ?? 0,
-          outputTokens: chunk.eval_count ?? 0,
-          cacheReadTokens: 0,
-          cacheWriteTokens: 0,
-        });
-
-        if (hasToolCalls) {
-          stream.pushFinishReason("tool_calls");
-        } else {
-          stream.pushFinishReason(chunk.done_reason === "length" ? "length" : "stop");
-        }
+        stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
+        stream.end();
       }
     }
 
     // Ghost-token detection: model generated tokens but we received nothing
-    if (!hasContent && !hasToolCalls && chunks.length > 0) {
+    if (output.content.length === 0 && chunks.length > 0) {
       if (isGhostTokenStream(chunks)) {
         // Retry with stream: false
         console.log("[ollama] Ghost token detected — retrying with stream: false");
-        await retryNonStreaming(baseUrl, headers, body, stream);
+        await retryNonStreaming(baseUrl, headers, body, stream, output);
         return;
       }
 
@@ -484,9 +514,20 @@ export async function streamNativeChat(
     }
   } catch (err) {
     if (signal?.aborted) {
-      stream.pushFinishReason("stop");
+      output.stopReason = "aborted";
+      (output as any).errorMessage = "Request was aborted";
+      stream.push({ type: "error", reason: "aborted", error: output });
+      stream.end();
       return;
     }
+
+    for (const block of output.content) {
+      delete (block as any).partial;
+    }
+    output.stopReason = "error";
+    (output as any).errorMessage = err instanceof Error ? err.message : String(err);
+    stream.push({ type: "error", reason: "error", error: output });
+    stream.end();
     throw err;
   }
 }
@@ -500,6 +541,7 @@ async function retryNonStreaming(
   headers: Record<string, string>,
   body: OllamaChatRequest,
   stream: AssistantMessageEventStream,
+  output: any,
 ): Promise<void> {
   const nonStreamBody = { ...body, stream: false };
 
@@ -520,32 +562,58 @@ async function retryNonStreaming(
     throw new Error(`[ollama] Non-stream retry error: ${result.error}`);
   }
 
+  stream.push({ type: "start", partial: output });
+
+  let textIndex = 0;
+  let thinkingIndex = 0;
+  let toolCallIndex = 0;
+
   if (result.message) {
+    // Text content
     if (result.message.content) {
-      stream.pushTextDelta(result.message.content);
+      const textBlock = { type: "text", text: result.message.content };
+      output.content.push(textBlock);
+      stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
+      stream.push({ type: "text_delta", contentIndex: textIndex, delta: result.message.content, partial: output });
+      stream.push({ type: "text_end", contentIndex: textIndex, content: result.message.content, partial: output });
+      textIndex++;
     }
+
+    // Thinking content
     if (result.message.thinking) {
-      stream.pushThinkingDelta?.(result.message.thinking);
-      stream.pushThinkingDelta?.(""); // close thinking
+      const thinkingBlock = { type: "thinking", thinking: result.message.thinking };
+      output.content.push(thinkingBlock);
+      stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: output });
+      stream.push({ type: "thinking_delta", contentIndex: thinkingIndex, delta: result.message.thinking, partial: output });
+      stream.push({ type: "thinking_end", contentIndex: thinkingIndex, content: result.message.thinking, partial: output });
+      thinkingIndex++;
     }
+
+    // Tool calls
     if (result.message.tool_calls && result.message.tool_calls.length > 0) {
       for (const tc of result.message.tool_calls) {
-        stream.pushToolCall(
-          tc.function.name,
-          JSON.stringify(tc.function.arguments),
-        );
+        const toolCallBlock = {
+          type: "toolCall",
+          id: `tool_${toolCallIndex}`,
+          name: tc.function.name,
+          arguments: tc.function.arguments,
+        };
+        output.content.push(toolCallBlock);
+        stream.push({ type: "toolcall_start", contentIndex: toolCallIndex, partial: output });
+        stream.push({ type: "toolcall_delta", contentIndex: toolCallIndex, delta: JSON.stringify(tc.function.arguments), partial: output });
+        stream.push({ type: "toolcall_end", contentIndex: toolCallIndex, toolCall: toolCallBlock, partial: output });
+        toolCallIndex++;
       }
     }
   }
 
-  stream.pushUsage({
-    inputTokens: result.prompt_eval_count ?? 0,
-    outputTokens: result.eval_count ?? 0,
-    cacheReadTokens: 0,
-    cacheWriteTokens: 0,
-  });
+  output.usage.input = result.prompt_eval_count ?? 0;
+  output.usage.output = result.eval_count ?? 0;
+  output.usage.totalTokens = output.usage.input + output.usage.output;
 
-  const hasToolCalls =
-    result.message?.tool_calls && result.message.tool_calls.length > 0;
-  stream.pushFinishReason(hasToolCalls ? "tool_calls" : "stop");
+  const hasToolCalls = result.message?.tool_calls && result.message.tool_calls.length > 0;
+  output.stopReason = hasToolCalls ? "toolUse" : "stop";
+
+  stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
+  stream.end();
 }

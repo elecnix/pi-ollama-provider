@@ -31,8 +31,15 @@
 
 import type {
   ExtensionAPI,
-  AssistantMessageEventStream,
 } from "@mariozechner/pi-coding-agent";
+import type {
+  AssistantMessageEventStream,
+  Context,
+  Model,
+  SimpleStreamOptions,
+  Api,
+} from "@mariozechner/pi-ai";
+import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
 
 import {
   resolveConfig,
@@ -89,14 +96,12 @@ function createNativeStreamSimple(
   settings: OllamaSettings,
 ) {
   return (
-    model: { id: string; contextWindow?: number; input?: string[] },
-    context: {
-      messages: Array<Record<string, unknown>>;
-      tools?: Array<Record<string, unknown>>;
-    },
-    stream: AssistantMessageEventStream,
-    options?: { signal?: AbortSignal },
-  ) => {
+    model: Model<Api>,
+    context: Context,
+    options?: SimpleStreamOptions,
+  ): AssistantMessageEventStream => {
+    const stream = createAssistantMessageEventStream();
+
     const modelSupportsVision = Array.isArray(model.input) && model.input.includes("image");
     const contextWindow = model.contextWindow || 32768;
 
@@ -111,13 +116,18 @@ function createNativeStreamSimple(
       apiKey,
       model: model.id,
       contextWindow: ollamaOptions.num_ctx as number ?? contextWindow,
-      messages: context.messages,
-      tools: context.tools,
+      messages: context.messages as Array<Record<string, unknown>>,
+      tools: context.tools as Array<Record<string, unknown>> | undefined,
       modelSupportsVision,
       ollamaOptions,
       signal: options?.signal,
       keepAlive: settings.keepAlive || getDefaultKeepAlive(),
+    }).catch((err) => {
+      // Errors are already pushed to the stream via error events
+      console.error("[ollama] Stream error:", err);
     });
+
+    return stream;
   };
 }
 
