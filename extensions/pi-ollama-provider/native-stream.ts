@@ -479,7 +479,7 @@ export async function streamNativeChat(
           stream.push({ type: "thinking_delta", contentIndex: activeThinkingBlock.index, delta: chunk.message.thinking, partial: output });
         }
 
-        // Tool calls — Ollama sends them complete, emit as a burst
+        // Tool calls — emit as a complete burst
         if (chunk.message.tool_calls && chunk.message.tool_calls.length > 0) {
           // Close any open text/thinking block
           if (activeTextBlock) {
@@ -492,17 +492,27 @@ export async function streamNativeChat(
           }
 
           for (const tc of chunk.message.tool_calls) {
+            // Ollama may return arguments as a JSON string or as an object
+            let args = tc.function.arguments;
+            if (typeof args === "string") {
+              try {
+                args = JSON.parse(args);
+              } catch {
+                args = {};
+              }
+            }
+
             const toolCallBlock = {
               type: "toolCall",
               id: `tool_${toolCallIndex}`,
               name: tc.function.name,
-              arguments: tc.function.arguments,
+              arguments: args,
             };
             output.content.push(toolCallBlock);
             stream.push({ type: "toolcall_start", contentIndex: toolCallIndex, partial: output });
 
             // Ollama sends complete tool calls, so single delta + end
-            const argsStr = JSON.stringify(tc.function.arguments);
+            const argsStr = JSON.stringify(args);
             stream.push({ type: "toolcall_delta", contentIndex: toolCallIndex, delta: argsStr, partial: output });
             stream.push({ type: "toolcall_end", contentIndex: toolCallIndex, toolCall: toolCallBlock, partial: output });
 
@@ -640,15 +650,25 @@ async function retryNonStreaming(
     // Tool calls
     if (result.message.tool_calls && result.message.tool_calls.length > 0) {
       for (const tc of result.message.tool_calls) {
+        // Ollama may return arguments as a JSON string or as an object
+        let args = tc.function.arguments;
+        if (typeof args === "string") {
+          try {
+            args = JSON.parse(args);
+          } catch {
+            args = {};
+          }
+        }
+
         const toolCallBlock = {
           type: "toolCall",
           id: `tool_${toolCallIndex}`,
           name: tc.function.name,
-          arguments: tc.function.arguments,
+          arguments: args,
         };
         output.content.push(toolCallBlock);
         stream.push({ type: "toolcall_start", contentIndex: toolCallIndex, partial: output });
-        stream.push({ type: "toolcall_delta", contentIndex: toolCallIndex, delta: JSON.stringify(tc.function.arguments), partial: output });
+        stream.push({ type: "toolcall_delta", contentIndex: toolCallIndex, delta: JSON.stringify(args), partial: output });
         stream.push({ type: "toolcall_end", contentIndex: toolCallIndex, toolCall: toolCallBlock, partial: output });
         toolCallIndex++;
       }
