@@ -27,6 +27,15 @@ import { Type } from "@sinclair/typebox";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+// Import shared capability inference functions (DRY)
+import {
+  hasVision,
+  hasToolSupport,
+  hasReasoning,
+  extractContextLength,
+  type OllamaShowResponse,
+} from "./discovery.js";
+
 const CLOUD_PROVIDER_NAME = "ollama-cloud";
 
 /** Cloud base URL, configurable via OLLAMA_API_BASE env var */
@@ -139,8 +148,9 @@ export async function fetchCloudModels(
     }));
 
     // Filter: only tool-capable models (coding agent requires tools)
+    // Use shared capability detection for consistency with local models
     return models.filter((m) =>
-      m.capabilities?.includes("tools") || isToolCapableByName(m.id),
+      hasToolSupport(m.capabilities || [], {}, undefined, m.id),
     );
   } catch (err) {
     console.log(
@@ -152,11 +162,12 @@ export async function fetchCloudModels(
 
 /**
  * Fetch detailed model info from ollama.com /api/show.
+ * Returns the same format as local /api/show for consistency.
  */
 export async function fetchCloudModelDetails(
   modelName: string,
   apiKey: string,
-): Promise<Record<string, unknown> | null> {
+): Promise<OllamaShowResponse | null> {
   try {
     const res = await fetch(`${CLOUD_BASE_URL}/api/show`, {
       method: "POST",
@@ -173,34 +184,14 @@ export async function fetchCloudModelDetails(
   }
 }
 
-/**
- * Heuristic: some model names indicate tool capability even without
- * the explicit capability flag.
- */
-function isToolCapableByName(modelId: string): boolean {
-  const lower = modelId.toLowerCase();
-  const toolFamilies = [
-    "llama3.1",
-    "llama3.3",
-    "qwen2.5",
-    "qwen3",
-    "qwen3.5",
-    "mistral",
-    "gemma4",
-    "deepseek-v4",
-    "command-r",
-    "granite",
-    "phi4",
-    "kimi",
-  ];
-  return toolFamilies.some((f) => lower.includes(f));
-}
-
 // ── cloud provider registration ──
 
 /**
  * Register the ollama-cloud provider with pi.
  * Only includes tool-capable models with zero cost (subscription, not per-token).
+ * 
+ * Uses the same capability inference as local discovery for consistency.
+ * Fetches /api/show for each model to get full capabilities.
  */
 export async function registerCloudProvider(
   pi: ExtensionAPI,
@@ -214,24 +205,55 @@ export async function registerCloudProvider(
     return 0;
   }
 
+  // Fetch /api/show details for each cloud model (parallel, with timeout)
+  const detailResults = new Map<string, OllamaShowResponse | null>();
+  const DETAIL_TIMEOUT_MS = 5000;
+  await Promise.race([
+    Promise.all(
+      clouds.map(async (m) => {
+        detailResults.set(m.id, await fetchCloudModelDetails(m.id, apiKey));
+      }),
+    ),
+    new Promise((r) => setTimeout(r, DETAIL_TIMEOUT_MS)),
+  ]);
+
   const modelConfigs = clouds.map((model) => {
-    const contextWindow = model.context_length || 131072;
-    const isCloud = true;
+    const details = detailResults.get(model.id);
+    
+    // Merge capabilities from /v1/models and /api/show (prefer /api/show)
+    const v1Capabilities = model.capabilities || [];
+    const showCapabilities: string[] =
+      details?.capabilities ||
+      details?.details?.capabilities ||
+      [];
+    const capabilities = [...new Set([...v1Capabilities, ...showCapabilities])];
+    
+    // Extract model info from /api/show response if available
+    const modelInfo: Record<string, unknown> = details?.model_info ?? {};
+    const family = (details?.details?.family as string) || "";
+    
+    // Get context length from model_info or fallback to /v1/models value
+    let contextWindow = model.context_length || 131072;
+    const ctxLength = extractContextLength(modelInfo);
+    if (ctxLength !== null) {
+      contextWindow = ctxLength;
+    }
+
+    // Use shared capability inference (same logic as local discovery)
+    const reasoning = hasReasoning(capabilities, model.id);
+    const vision = hasVision(capabilities, modelInfo, family);
+    const toolSupport = hasToolSupport(capabilities, modelInfo, family, model.id);
 
     return {
       id: model.id,
       name: `${model.name || model.id} (cloud)`,
-      reasoning:
-        model.capabilities?.includes("thinking") ||
-        /\b(r1|deepseek-r1|gemma4|qwen3)\b/i.test(model.id),
-      input: (model.capabilities?.includes("vision")
-        ? ["text", "image"]
-        : ["text"]) as ("text" | "image")[],
+      reasoning,
+      input: vision ? (["text", "image"] as ("text" | "image")[]) : (["text"] as ("text" | "image")[]),
       contextWindow,
       maxTokens: Math.min(Math.round(contextWindow * 0.25), 131072),
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      toolSupport: true,
-      isCloud,
+      toolSupport,
+      isCloud: true,
       ollamaName: model.id,
     };
   });
