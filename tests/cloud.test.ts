@@ -1337,7 +1337,6 @@ describe("registerCloudProvider with /api/show fetching", () => {
     const pi = createMockPi();
     await registerCloudProvider(pi, "test-key");
 
-    const call = getMockFetch().mock.calls[0];
     const providerConfig = pi.registerProvider.mock.calls[0][1];
     const model = providerConfig.models[0];
     // Should use the value from /api/show (128000), not the fallback (100000)
@@ -1345,22 +1344,34 @@ describe("registerCloudProvider with /api/show fetching", () => {
   });
 
   it("falls back to /v1/models context_length when /api/show times out", async () => {
-    // Simulate timeout by delaying /api/show responses
+    // Simulate /api/show timing out: mock /v1/models fast, but /api/show hangs
+    // so the Promise.race([details, setTimeout(5000)]) resolves via the timeout.
+    // We use vi.useFakeTimers to control the race.
+    vi.useFakeTimers();
+
     getMockFetch()
       .mockResolvedValueOnce({
         ok: true,
         json: async () => ({
           data: [{ id: "llama3.1:8b", capabilities: ["tools"], context_length: 32768 }],
         }),
-      });
+      })
+      // /api/show never resolves (hangs indefinitely)
+      .mockImplementationOnce(() => new Promise(() => {}));
 
     const pi = createMockPi();
-    await registerCloudProvider(pi, "test-key");
+    const providerPromise = registerCloudProvider(pi, "test-key");
+
+    // Advance past the 5s detail timeout
+    await vi.advanceTimersByTimeAsync(6000);
+    await providerPromise;
 
     const providerConfig = pi.registerProvider.mock.calls[0][1];
     const model = providerConfig.models[0];
     // Should fall back to /v1/models value when /api/show doesn't complete in time
     expect(model.contextWindow).toBe(32768);
+
+    vi.useRealTimers();
   });
 
   it("detects vision capability from /api/show model details", async () => {
@@ -1436,5 +1447,32 @@ describe("registerCloudProvider with /api/show fetching", () => {
     const model = providerConfig.models[0];
     // Should detect tool support from family (llama3.1)
     expect(model.toolSupport).toBe(true);
+  });
+
+  it("merges capabilities from /v1/models and /api/show", async () => {
+    getMockFetch()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          // /v1/models only reports "tools" capability
+          data: [{ id: "gemma4:27b", capabilities: ["tools"], context_length: 262144 }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          // /api/show reports both "tools" and "vision" capabilities
+          details: { family: "gemma4" },
+          capabilities: ["tools", "vision"],
+        }),
+      });
+
+    const pi = createMockPi();
+    await registerCloudProvider(pi, "test-key");
+
+    const providerConfig = pi.registerProvider.mock.calls[0][1];
+    const model = providerConfig.models[0];
+    // Vision capability from /api/show should be detected even though /v1/models lacked it
+    expect(model.input).toContain("image");
   });
 });

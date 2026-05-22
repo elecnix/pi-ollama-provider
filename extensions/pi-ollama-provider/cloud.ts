@@ -218,13 +218,19 @@ export async function registerCloudProvider(
   ]);
 
   const modelConfigs = clouds.map((model) => {
-    const capabilities = model.capabilities || [];
     const details = detailResults.get(model.id);
+    
+    // Merge capabilities from /v1/models and /api/show (prefer /api/show)
+    const v1Capabilities = model.capabilities || [];
+    const showCapabilities: string[] =
+      details?.capabilities ||
+      details?.details?.capabilities ||
+      [];
+    const capabilities = [...new Set([...v1Capabilities, ...showCapabilities])];
     
     // Extract model info from /api/show response if available
     const modelInfo: Record<string, unknown> = details?.model_info ?? {};
     const family = (details?.details?.family as string) || "";
-    const families = (details?.details?.families as string[]) || [];
     
     // Get context length from model_info or fallback to /v1/models value
     let contextWindow = model.context_length || 131072;
