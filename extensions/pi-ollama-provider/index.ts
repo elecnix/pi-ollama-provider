@@ -171,6 +171,7 @@ async function registerLocalProvider(pi: ExtensionAPI, settings: OllamaSettings)
     contextWindow: m.contextWindow,
     maxTokens: m.maxTokens,
     cost: m.cost,
+    tools: m.toolSupport,
   }));
 
   // Use native streaming or openai-compat based on settings
@@ -237,6 +238,7 @@ function registerFromCache(pi: ExtensionAPI): boolean {
     contextWindow: m.contextWindow,
     maxTokens: m.maxTokens,
     cost: m.cost,
+    tools: m.toolSupport,
   }));
 
   pi.unregisterProvider(LOCAL_PROVIDER_NAME);
