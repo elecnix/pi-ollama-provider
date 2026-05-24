@@ -250,13 +250,6 @@ function registerFromCache(pi: ExtensionAPI): boolean {
         supportsReasoningEffort: false,
       },
       models: piModels,
-      streamSimple: createNativeStreamSimple(
-        currentConfig.mode === "cloud"
-          ? currentConfig.baseUrl
-          : getOllamaHost(),
-        currentConfig.apiKey,
-        settings,
-      ),
     });
   } else {
     pi.registerProvider(LOCAL_PROVIDER_NAME, {
