@@ -175,6 +175,8 @@ async function registerLocalProvider(pi: ExtensionAPI, settings: OllamaSettings)
   }));
 
   // Use native streaming or openai-compat based on settings
+  // Note: We do NOT use streamSimple because it registers globally by API name
+  // and would overwrite other providers (like openrouter) that also use "openai-completions"
   if (settings.streamingMode === "native") {
     pi.unregisterProvider(LOCAL_PROVIDER_NAME);
     pi.registerProvider(LOCAL_PROVIDER_NAME, {
@@ -186,11 +188,6 @@ async function registerLocalProvider(pi: ExtensionAPI, settings: OllamaSettings)
         supportsReasoningEffort: false,
       },
       models: piModels,
-      streamSimple: createNativeStreamSimple(
-        config.mode === "cloud" ? config.baseUrl : baseUrl,
-        config.apiKey,
-        settings,
-      ),
     });
   } else {
     // OpenAI compat mode (fallback for old Ollama or user preference)
