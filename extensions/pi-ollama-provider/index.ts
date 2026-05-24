@@ -174,6 +174,8 @@ async function registerLocalProvider(pi: ExtensionAPI, settings: OllamaSettings)
   }));
 
   // Use native streaming or openai-compat based on settings
+  // Note: We do NOT use streamSimple because it overwrites other providers using "openai-completions" API
+  // The apiProviderRegistry is keyed by API name, so our streamSimple would replace openrouter's
   if (settings.streamingMode === "native") {
     pi.unregisterProvider(LOCAL_PROVIDER_NAME);
     pi.registerProvider(LOCAL_PROVIDER_NAME, {
@@ -185,11 +187,6 @@ async function registerLocalProvider(pi: ExtensionAPI, settings: OllamaSettings)
         supportsReasoningEffort: false,
       },
       models: piModels,
-      streamSimple: createNativeStreamSimple(
-        config.mode === "cloud" ? config.baseUrl : baseUrl,
-        config.apiKey,
-        settings,
-      ),
     });
   } else {
     // OpenAI compat mode (fallback for old Ollama or user preference)
@@ -237,40 +234,23 @@ function registerFromCache(pi: ExtensionAPI): boolean {
     contextWindow: m.contextWindow,
     maxTokens: m.maxTokens,
     cost: m.cost,
+    tools: m.toolSupport,
   }));
 
   pi.unregisterProvider(LOCAL_PROVIDER_NAME);
 
-  if (settings.streamingMode === "native") {
-    pi.registerProvider(LOCAL_PROVIDER_NAME, {
-      baseUrl: `${currentConfig.baseUrl}/v1`,
-      api: "openai-completions",
-      apiKey: currentConfig.apiKey,
-      compat: {
-        supportsDeveloperRole: false,
-        supportsReasoningEffort: false,
-      },
-      models: piModels,
-      streamSimple: createNativeStreamSimple(
-        currentConfig.mode === "cloud"
-          ? currentConfig.baseUrl
-          : getOllamaHost(),
-        currentConfig.apiKey,
-        settings,
-      ),
-    });
-  } else {
-    pi.registerProvider(LOCAL_PROVIDER_NAME, {
-      baseUrl: `${currentConfig.baseUrl}/v1`,
-      api: "openai-completions",
-      apiKey: currentConfig.apiKey,
-      compat: {
-        supportsDeveloperRole: false,
-        supportsReasoningEffort: false,
-      },
-      models: piModels,
-    });
-  }
+  // Note: We do NOT use streamSimple because it overwrites other providers using "openai-completions" API
+  // The apiProviderRegistry is keyed by API name, so our streamSimple would replace openrouter's
+  pi.registerProvider(LOCAL_PROVIDER_NAME, {
+    baseUrl: `${currentConfig.baseUrl}/v1`,
+    api: "openai-completions",
+    apiKey: currentConfig.apiKey,
+    compat: {
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: false,
+    },
+    models: piModels,
+  });
 
   console.log(`[ollama] ${modelConfigs.length} models from cache (v${cached.version}, ${Math.round((Date.now() - cached.timestamp) / 3600000)}h old)`);
   return true;
